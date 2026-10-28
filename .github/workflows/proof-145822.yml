@@ -1,0 +1,87 @@
+# TEMPORARY live proof for PR #145822 (never merges).
+# Real install.ps1 -IncludeDesktop on a fresh Windows runner with a BOM-marked
+# package.json planted in an ancestor of the install dir, base vs PR head.
+name: proof-145822
+on:
+  push:
+    branches: ['proof/145822-win']
+permissions:
+  contents: read
+jobs:
+  leg:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: base
+            branch: main
+            sha: 26ba38a098d8a68c5a260133bcf858a444d0b1b5
+          - leg: head
+            branch: proof/145822-head
+            sha: 2cf2e16890d5eba3381fd4a1cb24629f27d84188
+    name: ${{ matrix.leg }}
+    runs-on: windows-latest-32-core
+    timeout-minutes: 150
+    steps:
+      - name: Plant BOM-marked ancestor package.json
+        shell: powershell
+        timeout-minutes: 2
+        run: |
+          $p = Join-Path $env:LOCALAPPDATA 'package.json'
+          [IO.File]::WriteAllText($p, '{"name":"unrelated-parent","version":"1.0.0"}', [Text.UTF8Encoding]::new($true))
+          $b = [IO.File]::ReadAllBytes($p)[0..2] | ForEach-Object { '{0:X2}' -f $_ }
+          Write-Output "planted $p first bytes: $($b -join ' ')"
+      - name: Run real install.ps1 -IncludeDesktop
+        shell: powershell
+        timeout-minutes: 140
+        env:
+          LEG_BRANCH: ${{ matrix.branch }}
+          LEG_SHA: ${{ matrix.sha }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'leg'
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Set-Location $work
+          $ps1 = Join-Path $work 'install.ps1'
+          Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/NousResearch/hermes-agent/$env:LEG_SHA/scripts/install.ps1" -OutFile $ps1
+          $null = New-Item -ItemType File -Force (Join-Path $work 'empty.txt')
+          $instArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$ps1,'-Branch',$env:LEG_BRANCH,'-Commit',$env:LEG_SHA,'-NonInteractive','-IncludeDesktop','-SkipBrowser','-SkipComputerUse')
+          $p = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList $instArgs `
+               -RedirectStandardOutput (Join-Path $work 'install.out.log') -RedirectStandardError (Join-Path $work 'install.err.log') `
+               -RedirectStandardInput (Join-Path $work 'empty.txt') -NoNewWindow -PassThru -Wait
+          $code = $p.ExitCode
+          $all = (Get-Content -Raw (Join-Path $work 'install.out.log')) + (Get-Content -Raw (Join-Path $work 'install.err.log'))
+          $postcss = $all -match 'Failed to load PostCSS config'
+          $notJson = $all -match 'is not valid JSON'
+          Write-Output "RESULT {`"leg`":`"$env:LEG_BRANCH`",`"install_exit`":$code,`"postcss_error`":$($postcss.ToString().ToLower()),`"not_valid_json`":$($notJson.ToString().ToLower())}"
+          Get-Content (Join-Path $work 'install.out.log') -Tail 40
+          Get-Content (Join-Path $work 'install.err.log') -Tail 20
+          $dist = Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent\hermes_cli\web_dist\index.html'
+          Write-Output "web_dist index.html present: $(Test-Path $dist)"
+          Get-ChildItem (Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent\apps\desktop\release') -ErrorAction SilentlyContinue | Select-Object Name
+          exit 0
+      - name: PR regression test on this tree
+        shell: powershell
+        timeout-minutes: 15
+        env:
+          HEAD_SHA: 2cf2e16890d5eba3381fd4a1cb24629f27d84188
+        run: |
+          $root = Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent'
+          $test = Join-Path $root 'web\src\postcss-build.test.ts'
+          if (!(Test-Path $test)) { Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/NousResearch/hermes-agent/$env:HEAD_SHA/web/src/postcss-build.test.ts" -OutFile $test; Write-Output 'overlaid head test onto base tree' }
+          $node = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'hermes') -Recurse -Depth 6 -Filter node.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch 'node_modules' } | Select-Object -First 1
+          if (!$node) { $node = Get-Command node -ErrorAction SilentlyContinue | ForEach-Object { Get-Item $_.Source } }
+          Write-Output "node: $($node.FullName)"
+          Set-Location (Join-Path $root 'web')
+          & $node.FullName (Join-Path $root 'node_modules\vitest\vitest.mjs') run src/postcss-build.test.ts *> (Join-Path $env:RUNNER_TEMP 'leg\vitest.log')
+          $code = $LASTEXITCODE
+          Get-Content (Join-Path $env:RUNNER_TEMP 'leg\vitest.log') -Tail 40
+          Write-Output "RESULT {`"vitest_exit`":$code}"
+          exit 0
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: proof-145822-${{ matrix.leg }}
+          path: |
+            ${{ runner.temp }}/leg/*.log
+          retention-days: 7
